@@ -1,0 +1,868 @@
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(tidyr)
+library(lubridate)
+library(zoo)
+library(purrr)
+library(MASS)
+library(corrplot)
+library(ggrepel)
+library(ggforce)
+library(patchwork)
+library(GGally)
+library(gridExtra)
+library(glmnet)
+library(VIM)
+```
+
+```{r}
+rm(list = ls(all = TRUE))
+file_path <- "Redacted_Master_Data_ManufacturerA.xlsx"
+sheets <- excel_sheets("Redacted_Master_Data_ManufacturerA.xlsx")
+sheets <- sheets[!sheets %in% "All_Batches_A"]
+all_batches <- read_excel(file_path, sheet = "All_Batches_A")
+```
+```{r}
+time_to_minutes <- function(time_str) {
+  parts <- strsplit(time_str, ":")[[1]]
+  as.numeric(parts[1]) * 60 + as.numeric(parts[2])
+}
+
+
+minutes_to_time <- function(minutes) {
+  hours <- floor(minutes / 60)
+  mins <- minutes %% 60
+  sprintf("%02d:%02d", as.integer(hours), as.integer(mins))
+}
+
+calculate_duration <- function(start, end) {
+  tryCatch({
+    start_time <- period_to_seconds(hms(start))
+    end_time <- period_to_seconds(hms(end))
+    
+    duration <- end_time - start_time
+    duration <- ifelse(duration < 0, duration + 24 * 60 * 60, duration)
+    
+    hours <- floor(duration / 3600)
+    minutes <- floor((duration %% 3600) / 60)
+    
+    return(sprintf("%02d:%02d", hours, minutes))
+  }, error = function(e) {
+    warning("Error in calculate_duration: ", e$message)
+    return(NA_character_)
+  })
+}
+```
+
+```{r}
+all_batches_clean <- all_batches %>%
+  
+  select_if(~!all(is.na(.))) %>%
+  
+  filter_all(any_vars(!is.na(.))) %>%
+  
+  setNames(make.names(as.character(.[1,]))) %>%
+  slice(-1) %>%
+  slice(1:(n() - 3)) %>%
+ 
+  mutate(Date = as.Date(as.numeric(Date), origin = "1899-12-30")) %>%
+  
+  mutate(across(c(starts_with("Start"), starts_with("Finish"), starts_with("End")),
+                ~format(as.POSIXct(as.numeric(as.character(.)) * 86400, 
+                                   origin = "1970-01-01", 
+                                   tz = "UTC"), "%H:%M:%S")))  %>%
+  # 使用KNN方法进行插值
+  do({
+    columns_to_impute <- c("Mn", "Mw", "Mz", "D", "RM_1", "RM_2", "RM_3", "RM_4")
+    imputed_data <- kNN(., variable = columns_to_impute, k = 5) # k = 5 是一个常用的默认值，您可以根据需要调整
+    dplyr::select(imputed_data, -ends_with("_imp")) # 移除 kNN 函数添加的额外列
+  }) %>%
+  mutate(
+    Duration_1 = calculate_duration(Start.1, Finish.1),
+    Duration_2 = calculate_duration(Start.2, Finish.2),
+    Duration_3 = calculate_duration(Start.3, Finish.3),
+    Duration_4 = calculate_duration(Start.4, Finish.4),
+    Duration_5 = calculate_duration(Start.5, Finish.5),
+    Duration_6 = calculate_duration(Start.6, End.6)
+  ) %>%
+  mutate(Duration_3_minutes = sapply(Duration_3, function(x) {
+     if(x == "NA:NA") NA_real_ else time_to_minutes(x)
+   }))
+```
+
+
+```{r}
+all_batches_clean[31, 15:16] <- all_batches_clean[31, 15:16] %>%
+  mutate(across(c(Start.1, Finish.1), ~str_replace(., "^12:", "00:")))
+
+all_batches_clean[10, 15] <- str_replace(all_batches_clean[10, 15], "13:55:00", "13:15:00")
+
+all_batches_clean[6, 26] <- str_replace(all_batches_clean[6, 26], "^01:", "06:")
+```
+
+```{r}
+mean_duration <- mean(all_batches_clean$Duration_3_minutes, na.rm = TRUE)
+print(mean_duration)
+
+all_batches_clean <- all_batches_clean %>%
+  mutate(
+    Duration_3_minutes = ifelse(is.na(Duration_3_minutes), mean_duration, Duration_3_minutes),
+    Duration_3 = sapply(Duration_3_minutes, function(x) minutes_to_time(round(x)))
+  ) %>%
+  mutate(
+    Finish.3 = ifelse(is.na(Finish.3), 
+                      format(as.POSIXct(Start.3, format="%H:%M:%S") + 
+                               minutes(round(Duration_3_minutes)), "%H:%M:%S"),
+                      Finish.3)
+  ) %>%
+  dplyr::select(-Duration_3_minutes)
+```
+
+```{r}
+read_and_process_batch <- function(sheet) {
+  df <- read_excel(file_path, sheet = sheet)
+  
+  # 
+  if (as.numeric(sheet) <= 16) {
+    df$Timestamp <- dmy_hms(df$Timestamp)
+  }
+
+  df$Batch.UID <- as.character(sheet)
+  
+  df <- df %>%
+    mutate(Duration = as.duration(Timestamp - min(Timestamp, na.rm = TRUE))) %>%
+    filter(!is.na(Duration))  
+  
+  return(df)
+}
+
+df <- map_df(sheets, read_and_process_batch)
+```
+
+```{r}
+actual_dates <- df %>%
+  mutate(Date = as.Date(Timestamp)) %>%  
+  group_by(Batch.UID) %>%                
+  summarise(Date = min(Date), .groups = 'drop') 
+
+# Delete batch “17”
+all_batches_clean <- left_join(all_batches_clean, actual_dates, by = "Batch.UID")
+all_batches_clean <- all_batches_clean %>%
+  filter(complete.cases(.))
+```
+
+```{r}
+stage_times <- all_batches_clean %>%
+  mutate(
+    Start.1 = paste(Date.y, Start.1),
+    Finish.1 = paste(Date.y, Finish.1),
+    Start.2 = paste(Date.y, Start.2),
+    Finish.2 = paste(Date.y, Finish.2),
+    Start.3 = paste(Date.y, Start.3),
+    Finish.3 = paste(Date.y, Finish.3),
+    Start.4 = paste(Date.y, Start.4),
+    Finish.4 = paste(Date.y, Finish.4),
+    Start.5 = paste(Date.y, Start.5),
+    Finish.5 = paste(Date.y, Finish.5),
+    Start.6 = paste(Date.y, Start.6),
+    End.6 = paste(Date.y, End.6)
+  ) %>%
+  dplyr::select(Batch.UID, 
+         Start.1, Finish.1,
+         Start.2, Finish.2,
+         Start.3, Finish.3,
+         Start.4, Finish.4,
+         Start.5, Finish.5, 
+         Start.6, End.6)
+```
+
+```{r}
+fix_times <- function(row) {
+  time_cols <- grep("^(Start|Finish|End)", names(row), value = TRUE)
+  times <- as.POSIXct(unlist(row[time_cols]), format = "%Y-%m-%d %H:%M:%S")
+  
+  base_date <- as.Date(times[1])
+  
+  for (i in 1:length(times)) {
+   
+    if (hour(times[i]) == 0) {
+      
+      times[i] <- times[i] + days(1)
+    }
+    
+    if (i > 1 && times[i] < times[i-1]) {
+      times[i] <- times[i] + days(1)
+    }
+  }
+  
+  row[time_cols] <- format(times, "%Y-%m-%d %H:%M:%S")
+  return(row)
+}
+
+stage_times_fixed <- stage_times %>%
+  rowwise() %>%
+  do(as.data.frame(fix_times(.)))
+```
+
+
+```{r}
+colnames(df) <- c("Timestamp", "Reactor_Temp", 
+                  "Reactor_Press", "Mat_A_Flow", 
+                  "Mat_B_Flow", "Agitator_Amp", 
+                  "Batch.UID", "Duration")
+```
+
+```{r}
+filter_stage <- function(data, stage_times, start_col, end_col) {
+  data %>%
+    inner_join(stage_times, by = "Batch.UID") %>%
+    filter(Timestamp >= !!sym(start_col) & Timestamp <= !!sym(end_col)) %>%
+    dplyr::select(-starts_with("Start"), -starts_with("Finish"), -End.6)  
+}
+
+
+df_stage1 <- filter_stage(df, stage_times_fixed, "Start.1", "Finish.1")
+df_stage2 <- filter_stage(df, stage_times_fixed, "Start.2", "Finish.2")
+df_stage3 <- filter_stage(df, stage_times_fixed, "Start.3", "Finish.3")
+df_stage4 <- filter_stage(df, stage_times_fixed, "Start.4", "Finish.4")
+df_stage5 <- filter_stage(df, stage_times_fixed, "Start.5", "Finish.5")
+df_stage6 <- filter_stage(df, stage_times_fixed, "Start.6", "End.6")
+
+df_stage1 <- df_stage1 %>% mutate(Stage = "Stage 1")
+df_stage2 <- df_stage2 %>% mutate(Stage = "Stage 2")
+df_stage3 <- df_stage3 %>% mutate(Stage = "Stage 3")
+df_stage4 <- df_stage4 %>% mutate(Stage = "Stage 4")
+df_stage5 <- df_stage5 %>% mutate(Stage = "Stage 5")
+df_stage6 <- df_stage6 %>% mutate(Stage = "Stage 6")
+```
+
+```{r}
+unique(df_stage1$Batch.UID)
+unique(df_stage2$Batch.UID)
+unique(df_stage3$Batch.UID)
+unique(df_stage4$Batch.UID)
+unique(df_stage5$Batch.UID)
+unique(df_stage6$Batch.UID)
+```
+
+
+```{r}
+filter_df <- bind_rows(df_stage1, df_stage2, df_stage3, df_stage4, df_stage5, df_stage6)
+
+filter_df$Stage <- factor(filter_df$Stage, 
+                          levels = c("Stage 1", "Stage 2", 
+                                     "Stage 3", "Stage 4", 
+                                     "Stage 5", "Stage 6"))
+
+
+filter_df <- filter_df %>% 
+  arrange(Batch.UID, Timestamp) %>% 
+  group_by(Batch.UID) %>%
+  mutate(
+    min_timestamp = min(Timestamp),
+    Duration = as.duration(Timestamp - min_timestamp)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-min_timestamp)
+```
+
+```{r}
+get_global_max_batch <- function(df, y_var) {
+  df %>%
+    slice_max(order_by = !!sym(y_var), n = 1)
+}
+```
+
+
+```{r}
+temperature_plot <- ggplot(filter_df, aes(x = Duration, y = Reactor_Temp, color = Batch.UID)) +
+  geom_line() +
+  labs(title = "Reactor Temperature Over Duration Across All Batches", 
+       x = "Duration (Seconds)", 
+       y = "Temperature (degC)") +
+  theme_minimal()
+
+pressure_plot <- ggplot(filter_df, aes(x = Duration, y = Reactor_Press, color = Batch.UID)) +
+  geom_line() +
+  geom_text_repel(data = get_global_max_batch(filter_df, "Reactor_Press"), 
+                  aes(label = Batch.UID),
+                  box.padding = 0.5, point.padding = 0.5, size = 4) +
+  labs(title = "Reactor Pressure Over Duration Across All Batches", 
+       x = "Duration (Seconds)", 
+       y = "Pressure (bar)") +
+  theme_minimal()
+
+Mat_A <- ggplot(filter_df, aes(x = Duration, y = Mat_A_Flow, color = Batch.UID)) +
+  geom_line() +
+  geom_text_repel(data = get_global_max_batch(filter_df, "Mat_A_Flow"), 
+                  aes(label = Batch.UID),
+                  box.padding = 0.5, point.padding = 0.5, size = 4) +
+  labs(title = "Mat_A_Flow Over Duration Across All Batches", 
+       x = "Duration (Seconds)", 
+       y = "Mat_A_Flow") +
+  theme_minimal()
+
+Mat_B <- ggplot(filter_df, aes(x = Duration, y = Mat_B_Flow, color = Batch.UID)) +
+  geom_line() +
+  labs(title = "Mat_B_Flow Over Duration Across All Batches", 
+       x = "Duration (Seconds)", 
+       y = "Mat_B_Flow") +
+  theme_minimal()
+
+agitator <- ggplot(filter_df, aes(x = Duration, y = Agitator_Amp, color = Batch.UID)) +
+  geom_line() +
+  labs(title = "Agitator_Amp Over Duration Across All Batches", 
+       x = "Duration (Seconds)", 
+       y = "Agitator_Amp") +
+  theme_minimal()
+
+print(temperature_plot)
+print(pressure_plot)
+print(Mat_A)
+print(Mat_B)
+print(agitator)
+```
+
+```{r}
+df_stage1 <- df_stage1 %>% dplyr::select(-Mat_A_Flow,-Mat_B_Flow)
+df_stage3 <- df_stage3 %>% dplyr::select(-Mat_A_Flow,-Mat_B_Flow)
+df_stage5 <- df_stage5 %>% dplyr::select(-Mat_A_Flow,-Mat_B_Flow)
+df_stage6 <- df_stage6 %>% dplyr::select(-Mat_A_Flow,-Mat_B_Flow)
+```
+
+```{r}
+df_stage2 <- df_stage2 %>% 
+  filter(Mat_A_Flow >= 100, Mat_B_Flow >= 1000) %>%
+  group_by(Batch.UID) %>%
+  mutate(
+    min_timestamp = min(Timestamp),
+    Duration = as.duration(Timestamp - min_timestamp)
+  ) %>%
+  ungroup() 
+
+df_stage4 <- df_stage4 %>% 
+  dplyr::select(-Mat_B_Flow) %>%
+  filter(Mat_A_Flow >= 100) %>%
+  group_by(Batch.UID) %>%
+  mutate(
+    min_timestamp = min(Timestamp),
+    Duration = as.duration(Timestamp - min_timestamp)
+  ) %>%
+  ungroup() 
+```
+
+```{r}
+df_all_stages <- bind_rows(
+  df_stage1, df_stage2, df_stage3, 
+  df_stage4, df_stage5, df_stage6
+)
+
+overall_avg_stirrer <- df_all_stages %>%
+  group_by(Batch.UID) %>%
+  summarise(Overall_Avg_Stirrer = mean(Agitator_Amp))
+```
+
+```{r}
+df_summary <- df_stage1 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage1_Temp_Variation = max(Reactor_Temp) - 85,  
+      Stage1_Max_Temp = max(Reactor_Temp),
+      Stage1_Min_Temp = min(Reactor_Temp),
+      Stage1_Avg_Stirrer = mean(Agitator_Amp)
+    ) %>%
+  full_join(
+    df_stage2 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage2_Total_Time = max(Duration),
+      Stage2_Mat_A_Flow_SD = sd(Mat_A_Flow),
+      Stage2_Mat_B_Flow_SD = sd(Mat_B_Flow),
+      Stage2_Max_Temp = max(Reactor_Temp),
+      Stage2_Min_Temp = min(Reactor_Temp),
+      Stage2_Avg_Stirrer = mean(Agitator_Amp)
+    ),
+    by = "Batch.UID"
+  ) %>%
+  full_join(
+    df_stage3 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage3_Temp_Variation = max(Reactor_Temp) - 95,  
+      Stage3_Max_Temp = max(Reactor_Temp),
+      Stage3_Min_Temp = min(Reactor_Temp),
+      Stage3_Avg_Stirrer = mean(Agitator_Amp)
+    ),
+    by = "Batch.UID"
+  ) %>%
+  full_join(
+    df_stage4 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage4_Total_Time = max(Duration),
+      Stage4_Mat_A_Flow_SD = sd(Mat_A_Flow),
+      Stage4_Max_Temp = max(Reactor_Temp),
+      Stage4_Min_Temp = min(Reactor_Temp),
+      Stage4_Avg_Stirrer = mean(Agitator_Amp)
+    ),
+    by = "Batch.UID"
+  ) %>%
+  full_join(
+    df_stage5 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage5_Temp_Variation = sqrt(mean((Reactor_Temp - 95)^2 / var(Reactor_Temp))), 
+      Stage5_Max_Temp = max(Reactor_Temp),
+      Stage5_Min_Temp = min(Reactor_Temp),
+      Stage5_Avg_Stirrer = mean(Agitator_Amp)
+    ),
+    by = "Batch.UID"
+  ) %>%
+  full_join(
+    df_stage6 %>%
+    group_by(Batch.UID) %>%
+    summarise(
+      Stage6_Temp_Variation = 62 - min(Reactor_Temp),  
+      Stage6_Max_Temp = max(Reactor_Temp),
+      Stage6_Min_Temp = min(Reactor_Temp),
+      Stage6_Avg_Stirrer = mean(Agitator_Amp)
+    ),
+    by = "Batch.UID"
+  ) %>%
+  left_join(overall_avg_stirrer, by = "Batch.UID")
+```
+
+```{r}
+selected <- all_batches_clean %>%
+  dplyr::select(Batch.UID, `Solids....`, `Viscosity...25.C..poise.`, `SG..g.ml.`, 
+            Mn, Mw, Mz, D, RM_1, RM_2, RM_3, RM_4)
+
+df_summary <- df_summary %>%
+  left_join(selected, by = "Batch.UID") %>%
+  mutate(across(-Batch.UID, ~as.numeric(as.character(.)))) %>%
+  rename(
+    Solids = `Solids....`,
+    Viscosity = `Viscosity...25.C..poise.`,
+    SG = `SG..g.ml.`,
+    RM1 = RM_1,
+    RM2 = RM_2,
+    RM3 = RM_3,
+    RM4 = RM_4
+  )
+
+colnames(df_summary)
+```
+
+```{r}
+process_metrics <- df_summary[, 1:29]  
+QC_metrics <- df_summary[, 30:40]  
+```
+
+```{r}
+QC_metrics$In_Spec <- ifelse(
+  QC_metrics$Solids >= 49 & QC_metrics$Solids <= 51 &
+  QC_metrics$Viscosity >= 6 & QC_metrics$Viscosity <= 9 &
+  QC_metrics$SG >= 0.926 & QC_metrics$SG <= 0.954,
+  1,  
+  0   
+)
+QC_metrics$In_Spec
+```
+
+
+```{r}
+process_metrics_scaled <- as.data.frame(scale(process_metrics[,-1]))  
+QC_metrics_scaled <- as.data.frame(scale(QC_metrics))
+pca <- prcomp(process_metrics_scaled, center = TRUE, scale. = TRUE)
+plot(pca,type="line")
+```
+```{r}
+library(ggbiplot)
+
+pca_df <- as.data.frame(pca$x[, 1:2])
+pca_df$Batch.UID <- factor(df_summary$Batch.UID)
+pca_df$Viscosity <- factor(df_summary$Viscosity) 
+
+g <- ggbiplot(pca, obs.scale = 1, var.scale = 1) +
+  geom_point(aes(color = pca_df$Batch.UID), size = 3) +
+  geom_text_repel(aes(label = pca_df$Batch.UID, color = pca_df$Batch.UID), 
+                  size = 3, 
+                  vjust = -0.5, 
+                  max.overlaps = Inf, 
+                  box.padding = 0.35, 
+                  point.padding = 0.3, 
+                  segment.size = 0.2) +
+  scale_color_discrete(name = 'Batch.UID') +
+  theme_minimal() +
+   theme(legend.position = 'right', 
+        legend.title = element_text(size = 10), 
+        legend.text = element_text(size = 8),
+        legend.key.size = unit(0.5, 'lines')) +  
+  xlim(c(min(pca$x[, 1]) - 3, max(pca$x[, 1])+3 )) +  
+  ylim(c(min(pca$x[, 2])-3, max(pca$x[, 2]) + 3.)) 
+plot(g)
+```
+
+```{r}
+pca_test <- scale(process_metrics[, c( "Overall_Avg_Stirrer",
+                                       "Stage2_Mat_B_Flow_SD","Stage2_Mat_A_Flow_SD",
+                                       "Stage5_Temp_Variation",
+                                       "Stage4_Total_Time","Stage2_Total_Time",
+                                       "Stage5_Min_Temp", "Stage5_Max_Temp",
+                                       
+                                       "Stage3_Min_Temp","Stage3_Max_Temp",
+                                       
+                                       "Stage1_Avg_Stirrer","Stage6_Avg_Stirrer",
+                                       "Stage3_Avg_Stirrer","Stage5_Avg_Stirrer",
+                                       "Stage2_Avg_Stirrer","Stage4_Avg_Stirrer"
+                                      )])
+test_result <- prcomp(pca_test, scale. = TRUE)
+test_df <- as.data.frame(test_result$x[, 1:2])
+test_df$Batch.UID <- factor(df_summary$Batch.UID)
+test_df$Viscosity <- factor(df_summary$Viscosity) 
+testplot <- ggbiplot(test_result, obs.scale = 1, var.scale = 1, 
+              groups = test_df$Viscosity,ellipse = T) +
+  scale_color_discrete(name = '') +
+  theme(legend.direction = 'horizontal', legend.position = 'top')
+plot(testplot)
+names(process_metrics)
+```
+
+```{r}
+feed_time_cols <- c("Stage2_Total_Time",  
+                    "Stage4_Total_Time")
+
+feed_flow_cols <- c("Stage2_Mat_A_Flow_SD", "Stage2_Mat_B_Flow_SD", 
+                    "Stage4_Mat_A_Flow_SD")
+
+temp_Deviation_cols <- c("Stage1_Temp_Variation",  "Stage3_Temp_Variation",  
+                         "Stage5_Temp_Variation",  "Stage6_Temp_Variation")
+
+temp_max_cols <- c("Stage1_Max_Temp", "Stage2_Max_Temp", 
+                   "Stage3_Max_Temp", "Stage4_Max_Temp", 
+                   "Stage5_Max_Temp", "Stage6_Max_Temp")
+
+temp_min_cols <- c("Stage1_Min_Temp", "Stage2_Min_Temp", 
+                   "Stage3_Min_Temp", "Stage4_Min_Temp", 
+                   "Stage5_Min_Temp", "Stage6_Min_Temp")
+
+stirrer_speed_cols <- c("Stage1_Avg_Stirrer", "Stage2_Avg_Stirrer", "Stage3_Avg_Stirrer", 
+                        "Stage4_Avg_Stirrer", "Stage5_Avg_Stirrer", "Stage6_Avg_Stirrer", 
+                        "Overall_Avg_Stirrer")
+```
+
+```{r}
+create_boxplot_with_jitter <- function(data, columns, title) {
+  data_long <- data %>%
+    dplyr::select(Batch.UID, all_of(columns)) %>%
+    pivot_longer(cols = -Batch.UID, names_to = "Metric", values_to = "Value")
+  
+  ggplot(data_long, aes(x = Metric, y = Value)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5, aes(color = Batch.UID)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+          axis.text.y = element_text(size = 8),
+          plot.title = element_text(size = 10),
+          legend.position = "none") +
+    labs(title = title, x = NULL, y = "Value")
+}
+
+```
+
+```{r}
+p1 <- create_boxplot_with_jitter(process_metrics, feed_time_cols, "Feed Time")
+p2 <- create_boxplot_with_jitter(process_metrics, feed_flow_cols, "Flow Rate Variation")
+p3 <- create_boxplot_with_jitter(process_metrics, temp_Deviation_cols, "Temperature Deviation")
+p4 <- create_boxplot_with_jitter(process_metrics, temp_max_cols, "Max Temperature")
+p5 <- create_boxplot_with_jitter(process_metrics, temp_min_cols, "Min Temperature")
+p6 <- create_boxplot_with_jitter(process_metrics, stirrer_speed_cols, "Average Stirrer Speed")
+combined_plot <- grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 3, 
+                              top = "Distribution of Process Metrics with Individual Batch Values")
+```
+
+```{r}
+plot_list <- list()
+
+for (col in names(QC_metrics[,1:11])) {
+  p <- ggplot(QC_metrics, aes(x = .data[[col]])) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = 'gray', color = 'black') +
+    geom_density(color = 'red') +
+    labs(title = col, x = NULL, y = NULL) + 
+    theme_minimal() +  
+    theme(plot.title = element_text(size = 10))  
+  
+  plot_list[[col]] <- p
+}
+
+combined_plot <- wrap_plots(plot_list, ncol = 4)
+
+print(combined_plot)
+```
+
+```{r}
+median_Mn <- median(df_summary$Mn[df_summary$Mn > 20000], na.rm = TRUE)
+QC_metrics$Mn[20] <- median_Mn
+```
+
+```{r}
+Solids_model <- lm(sqrt(Solids) ~ ., data = cbind(process_metrics[,-1], QC_metrics["Solids"]))
+Solids_step <- stepAIC(Solids_model,trace = FALSE)
+summary(Solids_step)
+par(mfrow=c(2,2))
+plot(Solids_step)
+```
+
+```{r}
+new_Solids_model <- lm(sqrt(Solids) ~ -1 +Stage1_Temp_Variation + Stage1_Min_Temp + 
+    Stage1_Avg_Stirrer + Stage2_Mat_B_Flow_SD + Stage2_Max_Temp + 
+    Stage2_Avg_Stirrer + Stage3_Temp_Variation + 
+    Stage3_Avg_Stirrer + Stage4_Total_Time + Stage4_Min_Temp + 
+    Stage5_Max_Temp + Stage5_Min_Temp + Stage5_Avg_Stirrer + 
+    Stage6_Temp_Variation + Stage6_Max_Temp, data = cbind(process_metrics[, 
+    -1], QC_metrics["Solids"]))
+summary(new_Solids_model)
+par(mfrow=c(2,2))
+plot(new_Solids_model)
+```
+
+```{r}
+SG_model <- lm(sqrt(SG) ~ ., data = cbind(process_metrics[,-1], QC_metrics["SG"]))
+SG_step <- stepAIC(SG_model, direction = "both", trace = FALSE)
+summary(SG_step)
+par(mfrow=c(2,2))
+plot(SG_step)
+```
+
+```{r}
+new_SG_model <- lm(sqrt(SG) ~ 
+    Stage1_Avg_Stirrer + Stage2_Mat_B_Flow_SD + 
+    Stage2_Max_Temp + Stage2_Avg_Stirrer + 
+    Stage3_Temp_Variation + Stage3_Min_Temp + Stage4_Max_Temp + 
+     
+    Stage5_Min_Temp + Stage5_Avg_Stirrer + 
+    Stage6_Avg_Stirrer + Overall_Avg_Stirrer, data = cbind(process_metrics[, 
+    -1], QC_metrics["SG"]))
+summary(new_SG_model)
+par(mfrow=c(2,2))
+plot(new_SG_model)
+```
+
+```{r}
+RM1_model <- lm(log(RM1+1) ~ ., data = cbind(process_metrics[,-1], QC_metrics["RM1"]))
+summary(RM1_model)
+RM1_step <- stepAIC(RM1_model, direction = "both", trace = FALSE)
+summary(RM1_step)
+par(mfrow=c(2,2))
+plot(RM1_step)
+```
+
+```{r}
+new_RM1_model <- lm(log(RM1 + 1) ~ -1 + Stage1_Min_Temp + 
+    Stage2_Mat_A_Flow_SD +  
+    Stage2_Min_Temp + Stage2_Avg_Stirrer + Stage3_Avg_Stirrer + 
+    Stage4_Min_Temp + 
+    Stage5_Avg_Stirrer, data = cbind(process_metrics[, -1], QC_metrics["RM1"]))
+
+
+summary(new_RM1_model)
+par(mfrow=c(2,2))
+plot(new_RM1_model)
+
+```
+
+```{r}
+RM2_model <- lm(RM2 ~ -1+., data = cbind(process_metrics[,-1], QC_metrics["RM2"]))
+RM2_step <- stepAIC(RM2_model, direction = "both", trace = FALSE)
+summary(RM2_step)
+par(mfrow=c(2,2))
+plot(RM2_step)
+```
+
+```{r}
+new_RM3_model <- lm( RM2 ~ Stage1_Temp_Variation + Stage1_Max_Temp + 
+    Stage1_Avg_Stirrer + Stage2_Total_Time + Stage2_Mat_A_Flow_SD + 
+    Stage2_Mat_B_Flow_SD + Stage2_Max_Temp + Stage2_Min_Temp + 
+    Stage3_Temp_Variation + Stage4_Total_Time + 
+    Stage4_Mat_A_Flow_SD + Stage4_Min_Temp + Stage4_Avg_Stirrer + 
+    Stage5_Max_Temp + Stage5_Avg_Stirrer + Stage6_Temp_Variation + 
+    Stage6_Max_Temp + Overall_Avg_Stirrer - 1, data = cbind(process_metrics[, 
+    -1], QC_metrics["RM2"]))
+summary(new_RM3_model)
+par(mfrow=c(2,2))
+plot(new_RM3_model)
+```
+
+
+```{r}
+RM3_model <- lm(sqrt(RM3) ~ ., data = cbind(process_metrics[,-1], QC_metrics["RM3"]))
+RM3_step <- stepAIC(RM3_model, direction = "both", trace = FALSE)
+summary(RM3_step)
+par(mfrow=c(2,2))
+plot(RM3_step)
+```
+
+```{r}
+
+new_RM3_model <- lm(sqrt(RM3) ~ Stage1_Min_Temp + Stage1_Avg_Stirrer + 
+    Stage2_Total_Time + Stage2_Mat_B_Flow_SD + 
+    Stage2_Avg_Stirrer + Stage3_Temp_Variation + 
+    Stage3_Avg_Stirrer +  Stage4_Avg_Stirrer + Stage5_Temp_Variation + 
+    Stage5_Max_Temp + Overall_Avg_Stirrer, 
+    data = cbind(process_metrics[, -1], QC_metrics["RM3"]))
+summary(new_RM3_model)
+par(mfrow=c(2,2))
+plot(new_RM3_model)
+
+```
+
+
+```{r}
+RM4_model <- lm(log(RM4+1) ~ ., data = cbind(process_metrics[,-1], QC_metrics["RM4"]))
+RM4_step <- stepAIC(RM4_model, direction = "both", trace = FALSE)
+summary(RM4_step)
+par(mfrow=c(2,2))
+plot(RM4_step)
+```
+
+```{r}
+new_RM4_model <- lm(log(RM4 + 1) ~ Stage1_Min_Temp + Stage2_Total_Time + 
+    Stage2_Mat_A_Flow_SD + Stage2_Min_Temp + Stage3_Avg_Stirrer + 
+    Stage4_Min_Temp + 
+    Stage5_Min_Temp + Stage5_Avg_Stirrer, data = cbind(process_metrics[, 
+    -1], QC_metrics["RM4"]))
+summary(new_RM4_model)
+par(mfrow=c(2,2))
+plot(new_RM4_model)
+```
+
+```{r}
+D_model <- lm(sqrt(D) ~ ., data = cbind(process_metrics[,-1], QC_metrics["D"]))
+D_step <- stepAIC(D_model, direction = "both", trace = FALSE)
+summary(D_step)
+par(mfrow=c(2,2))
+plot(D_step)
+```
+
+```{r}
+new_D_model <- lm(sqrt(D) ~ Stage1_Avg_Stirrer + 
+    Stage2_Avg_Stirrer + 
+    Stage3_Temp_Variation + Stage3_Avg_Stirrer + Stage4_Total_Time + 
+    Stage4_Min_Temp + Stage4_Avg_Stirrer + 
+    Stage5_Temp_Variation + Stage5_Max_Temp + 
+    Stage5_Avg_Stirrer, 
+    data = cbind(process_metrics[, -1], QC_metrics["D"]))
+summary(new_D_model)
+par(mfrow=c(2,2))
+plot(new_D_model)
+```
+
+
+
+```{r}
+Mn_model <- lm(sqrt(Mn) ~ ., data = cbind(process_metrics[,-1], QC_metrics["Mn"]))
+Mn_step <- stepAIC(Mn_model, direction = "both", trace = FALSE)
+summary(Mn_step)
+par(mfrow=c(2,2))
+plot(Mn_step)
+```
+
+```{r}
+new_Mn_model <- lm(sqrt(Mn) ~ Stage1_Avg_Stirrer + 
+    Stage2_Total_Time +  
+    Stage2_Avg_Stirrer + Stage3_Temp_Variation + Stage3_Avg_Stirrer + 
+    Stage4_Total_Time + 
+    Stage4_Min_Temp + Stage4_Avg_Stirrer + Stage5_Temp_Variation + 
+    Stage5_Max_Temp + Stage5_Min_Temp + Stage5_Avg_Stirrer + 
+    Overall_Avg_Stirrer, 
+    data = cbind(process_metrics[, -1], QC_metrics["Mn"]))
+summary(new_Mn_model)
+par(mfrow=c(2,2))
+plot(new_Mn_model)
+```
+
+
+```{r}
+Mw_model <- lm(sqrt(Mw) ~ ., data = cbind(process_metrics[,-1], QC_metrics["Mw"]))
+Mw_step <- stepAIC(Mw_model, direction = "both", trace = FALSE)
+summary(Mw_step)
+par(mfrow=c(2,2))
+plot(Mw_step)
+```
+
+```{r}
+new_Mw_model <- lm(sqrt(Mw) ~ Stage1_Min_Temp + 
+    Stage1_Avg_Stirrer + Stage2_Mat_A_Flow_SD + Stage2_Mat_B_Flow_SD + 
+    Stage2_Max_Temp + Stage2_Avg_Stirrer + Stage3_Temp_Variation + 
+    Stage4_Total_Time + 
+    Stage4_Mat_A_Flow_SD + Stage4_Max_Temp + Stage4_Min_Temp + 
+    Stage5_Avg_Stirrer + Stage6_Temp_Variation + Stage6_Max_Temp + 
+    Stage6_Avg_Stirrer + Overall_Avg_Stirrer, data = cbind(process_metrics[, 
+    -1], QC_metrics["Mw"]))
+summary(new_Mw_model)
+par(mfrow=c(2,2))
+plot(new_Mw_model)
+```
+
+
+```{r}
+Mz_model <- lm(sqrt(Mz) ~ ., data = cbind(process_metrics[,-1], QC_metrics["Mz"]))
+Mz_step <- stepAIC(Mz_model, direction = "both", trace = FALSE)
+summary(Mz_step)
+par(mfrow=c(2,2))
+plot(Mz_step)
+```
+
+```{r}
+new_Mz_model <- lm(sqrt(Mz) ~  
+    Stage1_Avg_Stirrer + Stage2_Max_Temp + 
+    Stage2_Min_Temp + Stage2_Avg_Stirrer + Stage3_Temp_Variation + 
+    Stage4_Max_Temp + 
+    Stage6_Avg_Stirrer, 
+    data = cbind(process_metrics[, -1], QC_metrics["Mz"]))
+
+summary(new_Mz_model)
+par(mfrow=c(2,2))
+plot(new_Mz_model)
+```
+
+```{r}
+
+calculate_rmse <- function(model) {
+  rmse <- sqrt(mean(residuals(model)^2))
+  return(rmse)
+}
+
+calculate_rmse_transformed <- function(model, inverse_transform) {
+  predicted <- predict(model)
+  actual <- model$model[[1]]  
+  
+  predicted_original <- inverse_transform(predicted)
+  actual_original <- inverse_transform(actual)
+  
+  rmse <- sqrt(mean((predicted_original - actual_original)^2))
+  return(rmse)
+}
+
+rmse_solids <- calculate_rmse_transformed(new_Solids_model, function(x) x^2)
+rmse_sg <- calculate_rmse_transformed(new_SG_model, function(x) x^2)
+rmse_mn <- calculate_rmse_transformed(new_Mn_model, function(x) x^2)
+rmse_mw <- calculate_rmse_transformed(new_Mw_model, function(x) x^2)
+rmse_mz <- calculate_rmse_transformed(new_Mz_model, function(x) x^2)
+rmse_d <- calculate_rmse_transformed(new_D_model, function(x) x^2)
+rmse_rm1 <- calculate_rmse_transformed(new_RM1_model, function(x) exp(x) - 1)
+rmse_rm2 <- calculate_rmse(RM2_step)
+rmse_rm3 <- calculate_rmse_transformed(new_RM3_model, function(x) x^2)
+rmse_rm4 <- calculate_rmse_transformed(new_RM4_model, function(x) exp(x) - 1)
+
+rmse_results <- data.frame(
+  Model = c("Solids", "SG", "Mn", "Mw", "Mz", "D", "RM1", "RM2", "RM3", "RM4"),
+  RMSE = c(rmse_solids, rmse_sg, rmse_mn, rmse_mw, rmse_mz, rmse_d, rmse_rm1, rmse_rm2, rmse_rm3, rmse_rm4)
+)
+
+print(rmse_results)
+```
+
